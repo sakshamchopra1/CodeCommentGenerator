@@ -24,6 +24,7 @@ import os
 import json
 import argparse
 import warnings
+from typing import Optional, List, Dict, Any, Tuple
 
 # Suppress SyntaxWarnings from ast.parse when evaluating legacy CodeSearchNet/Stdlib files
 warnings.filterwarnings("ignore", category=SyntaxWarning)
@@ -40,6 +41,7 @@ from .logger import PipelineLogger
 from .ir import build_ir, pretty_print_ir, serialize_ir
 from .analysis import build_cfg, run_dfa, detect_patterns
 from .security_analyzer import run_security_analysis, SecurityReport
+from .security import AgenticSecurityLayer, SecurityException
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -87,12 +89,28 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Disable Python stdlib dataset source")
     p.add_argument("--output-dir", metavar="DIR", default="outputs",
                    help="Directory for ML model outputs (default: outputs)")
+    p.add_argument("--prompt", type=str, default=None,
+                   help="User prompt or instruction for comment generation")
+    p.add_argument("--security-threshold", type=float, default=0.7,
+                   help="Risk score threshold to block malicious prompts (default: 0.7)")
+    p.add_argument("--sanitize-threshold", type=float, default=0.4,
+                   help="Risk score threshold to sanitize comments/docstrings (default: 0.4)")
+    p.add_argument("--show-security-logs", action="store_true",
+                   help="Display Agentic AI Security Layer structured audit logs")
     return p
 
 
-def run_pipeline(filepath: str, logger: PipelineLogger, ast_model=None, strict_ml: bool = False, engine: str = "rule_based"):
+def run_pipeline(
+    filepath: str,
+    logger: PipelineLogger,
+    ast_model=None,
+    strict_ml: bool = False,
+    engine: str = "rule_based",
+    user_prompt: Optional[str] = None,
+    security_layer: Optional[AgenticSecurityLayer] = None,
+):
     """
-    Execute the full pipeline (Week 7–8 stages + Week 9 ML generation).
+    Execute the full pipeline with Agentic AI Security Layer protection.
 
     Args:
         filepath:       Path to Python source file.
@@ -100,18 +118,74 @@ def run_pipeline(filepath: str, logger: PipelineLogger, ast_model=None, strict_m
         ast_model:      Optional ASTCommentModel for ML-based generation.
         strict_ml:      Require AST+NLP ML path when True (no rule fallback).
         engine:         One of "rule_based", "ml", "neurosymbolic".
+        user_prompt:    Optional user prompt/instruction to guide comment generation.
+        security_layer: Optional AgenticSecurityLayer instance.
 
     Returns:
         (annotated_source, comments, module_features, context_graph,
-         attach_result, ir_module, analysis_report)
+         attach_result, ir_module, analysis_report, security_report)
     """
+    if security_layer is None:
+        security_layer = AgenticSecurityLayer()
+
+    # ── Stage 0: Security Ingestion & Policy Inspection ──────────────
+    logger.begin_stage("security_ingestion")
+
+    # 1. Intercept and block malicious user prompts before NLP processing
+    if user_prompt:
+        prompt_decision = security_layer.inspect_prompt(user_prompt)
+        if prompt_decision.action == "BLOCK":
+            logger.end_stage(summary={
+                "status": "BLOCKED",
+                "risk_score": prompt_decision.risk_score,
+                "vector": prompt_decision.vector,
+                "matched_patterns": prompt_decision.matched_patterns,
+            })
+            raise SecurityException(
+                f"Execution blocked: Direct prompt injection / policy bypass detected in user prompt "
+                f"(risk score: {prompt_decision.risk_score:.2f})",
+                risk_score=prompt_decision.risk_score,
+                vector=prompt_decision.vector,
+                audit_entry=prompt_decision.to_dict(),
+            )
+
+    source_code = read_file(filepath)
+
+    # 2. Wire AST parser inspection so code-embedded comments/docstrings are scanned
+    # for indirect injection payloads, sanitizing them if they exceed the risk threshold
+    sanitized_source, decisions = security_layer.scan_and_sanitize_source(source_code)
+    sanitized_count = sum(1 for d in decisions if d.action == "SANITIZE")
+
+    # 3. Check if the remaining source code itself is a raw direct prompt injection attack
+    code_decision = security_layer.inspect_prompt(sanitized_source)
+    if code_decision.action == "BLOCK":
+        logger.end_stage(summary={
+            "status": "BLOCKED",
+            "risk_score": code_decision.risk_score,
+            "vector": code_decision.vector,
+            "matched_patterns": code_decision.matched_patterns,
+        })
+        raise SecurityException(
+            f"Execution blocked: Malicious prompt injection payload detected in source input "
+            f"(risk score: {code_decision.risk_score:.2f})",
+            risk_score=code_decision.risk_score,
+            vector=code_decision.vector,
+            audit_entry=code_decision.to_dict(),
+        )
+
+    logger.end_stage(summary={
+        "status": "ALLOW",
+        "user_prompt_checked": bool(user_prompt),
+        "sanitized_payloads": sanitized_count,
+    })
+
     # ── Stage 1: Parse ───────────────────────────────────────────────
     logger.begin_stage("parse")
-    source_code = read_file(filepath)
-    ast_tree = parse_code(source_code)
+    ast_tree = parse_code(sanitized_source, security_layer=security_layer)
     logger.end_stage(summary={
-        "total_lines": len(source_code.splitlines()),
+        "total_lines": len(sanitized_source.splitlines()),
         "file": filepath,
+        "sanitized_payloads": sanitized_count,
     })
 
     # ── Stage 2: Validate ────────────────────────────────────────────
@@ -125,7 +199,7 @@ def run_pipeline(filepath: str, logger: PipelineLogger, ast_model=None, strict_m
 
     # ── Stage 3: Extract AST Features ────────────────────────────────
     logger.begin_stage("extract")
-    module_features = extract_features(ast_tree, source_code, filepath=filepath)
+    module_features = extract_features(ast_tree, sanitized_source, filepath=filepath)
     logger.end_stage(summary={
         "functions": len(module_features.functions),
         "classes": len(module_features.classes),
@@ -134,7 +208,7 @@ def run_pipeline(filepath: str, logger: PipelineLogger, ast_model=None, strict_m
 
     # ── Stage 4: Analyze Context ─────────────────────────────────────
     logger.begin_stage("analyze")
-    context_graph = analyze_context(module_features, ast_tree, source_code)
+    context_graph = analyze_context(module_features, ast_tree, sanitized_source)
     complexity_dist = {}
     for fc in context_graph.function_contexts:
         lbl = fc.complexity_label
@@ -149,20 +223,20 @@ def run_pipeline(filepath: str, logger: PipelineLogger, ast_model=None, strict_m
     if engine == "neurosymbolic" and ast_model is not None:
         comments = neurosymbolic_generate_comments(
             module_features, context_graph, ast_model,
-            source_code=source_code,
+            source_code=sanitized_source,
             strict_ml=strict_ml,
         )
         gen_engine = "neurosymbolic"
     elif ast_model is not None:
         comments = ml_generate_comments(
             module_features, context_graph, ast_model,
-            source_code=source_code,
+            source_code=sanitized_source,
             strict_ml=strict_ml,
         )
         gen_engine = "ast+nlp_ml"
     else:
         comments = generate_comments(module_features, context_graph,
-                                     source_code=source_code)
+                                     source_code=sanitized_source)
         gen_engine = "rule_based"
     counts = {"docstring": 0, "inline": 0}
     for c in comments:
@@ -176,7 +250,7 @@ def run_pipeline(filepath: str, logger: PipelineLogger, ast_model=None, strict_m
 
     # ── Stage 6: Attach Comments ─────────────────────────────────────
     logger.begin_stage("attach")
-    attach_result = attach_comments(source_code, comments)
+    attach_result = attach_comments(sanitized_source, comments)
     logger.end_stage(summary={"comments_attached": attach_result.comments_attached})
 
     # ── Stage 7: Build IR ─────────────────────────────────────────────
@@ -202,7 +276,7 @@ def run_pipeline(filepath: str, logger: PipelineLogger, ast_model=None, strict_m
 
     # ── Stage 9: Security Analysis ────────────────────────────────────────
     logger.begin_stage("security")
-    security_report = run_security_analysis(module_features, context_graph, source_code)
+    security_report = run_security_analysis(module_features, context_graph, sanitized_source)
     logger.end_stage(summary={
         "total_issues": security_report.total_issues,
         "module_safe_pct": security_report.module_safe_pct,
@@ -300,9 +374,33 @@ def main():
             print("          Train first: python3 -m src.main --train")
             sys.exit(2)
 
+    security_layer = AgenticSecurityLayer(
+        block_threshold=args.security_threshold,
+        sanitize_threshold=args.sanitize_threshold,
+    )
+
     try:
         annotated, comments, mf, cg, attach_result, ir_module, analysis_report, security_report = \
-            run_pipeline(filepath, logger, ast_model=ast_model, strict_ml=args.ml or args.neurosymbolic, engine=engine)
+            run_pipeline(
+                filepath,
+                logger,
+                ast_model=ast_model,
+                strict_ml=args.ml or args.neurosymbolic,
+                engine=engine,
+                user_prompt=args.prompt,
+                security_layer=security_layer,
+            )
+    except SecurityException as e:
+        print(f"\n{'='*55}")
+        print("  [SECURITY BLOCKED] Agentic AI Security Layer Alert")
+        print(f"{'='*55}")
+        print(f"  {e}")
+        print(f"  Risk Score    : {e.risk_score:.2f}")
+        print(f"  Threat Vector : {e.vector}")
+        print("  Mitigation    : BLOCKED before NLP comment processing.")
+        print(f"{'='*55}\n")
+        security_layer.print_audit_logs()
+        sys.exit(3)
     except ParserError as e:
         print(f"\n{format_error(e)}")
         sys.exit(1)
@@ -398,6 +496,10 @@ def main():
                 indent=2,
             )
         print(f"    Analysis: {report_path}")
+
+    # ── Security Audit Logs ───────────────────────────────────────
+    if args.show_security_logs:
+        security_layer.print_audit_logs()
 
     print(f"\n{'='*55}\n")
 

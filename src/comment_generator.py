@@ -575,6 +575,8 @@ def generate_comments(
     module_features: ModuleFeatures,
     context_graph: ContextGraph,
     source_code: str = "",
+    security_layer=None,
+    user_prompt: Optional[str] = None,
 ) -> List[CommentItem]:
     """
     Generate AST-driven docstrings and inline comments for all undocumented
@@ -584,10 +586,15 @@ def generate_comments(
         module_features: Output of ast_extractor.extract_features().
         context_graph:   Output of context_analyzer.analyze_context().
         source_code:     Raw source string — used for body/raises analysis.
+        security_layer:  Optional AgenticSecurityLayer instance.
+        user_prompt:     Optional user prompt/instruction.
 
     Returns:
         List[CommentItem] sorted by line number.
     """
+    if user_prompt and security_layer is not None:
+        security_layer.validate_prompt(user_prompt)
+
     comments: List[CommentItem] = []
 
     # Build quick lookup: function name -> FunctionContext
@@ -639,6 +646,15 @@ def generate_comments(
                     target_name=ff.name,
                 ))
 
+    if security_layer is not None:
+        for c in comments:
+            score, matched_ids, matched = security_layer.compute_risk_score(c.text, vector_type="SOURCE_CODE_COMMENT")
+            if score >= security_layer.sanitize_threshold:
+                if c.kind == "inline":
+                    c.text = f"# {security_layer.SANITIZED_PLACEHOLDER}"
+                else:
+                    c.text = f'"""{security_layer.SANITIZED_PLACEHOLDER}"""'
+
     # Sort by lineno so attacher processes in order
     comments.sort(key=lambda c: (c.lineno, c.kind))
     return comments
@@ -654,6 +670,8 @@ def ml_generate_comments(
     ast_model=None,
     source_code: str = "",
     strict_ml: bool = False,
+    security_layer=None,
+    user_prompt: Optional[str] = None,
 ) -> List[CommentItem]:
     """
     Generate comments using ASTCommentModel — T5 fine-tuned on structured
@@ -675,10 +693,15 @@ def ml_generate_comments(
         ast_model:       A loaded ASTCommentModel instance (or None).
         source_code:     Raw source string — used only for raises extraction.
         strict_ml:       If True, require ML model and fail on ML generation errors.
+        security_layer:  Optional AgenticSecurityLayer instance.
+        user_prompt:     Optional user prompt/instruction.
 
     Returns:
         List[CommentItem] sorted by line number.
     """
+    if user_prompt and security_layer is not None:
+        security_layer.validate_prompt(user_prompt)
+
     if ast_model is None and strict_ml:
         raise RuntimeError(
             "AST+NLP ML mode requires a trained AST model. "
@@ -686,7 +709,13 @@ def ml_generate_comments(
         )
 
     if ast_model is None:
-        return generate_comments(module_features, context_graph, source_code)
+        return generate_comments(
+            module_features,
+            context_graph,
+            source_code,
+            security_layer=security_layer,
+            user_prompt=user_prompt,
+        )
 
     fc_map: Dict[str, FunctionContext] = {
         fc.name: fc for fc in context_graph.function_contexts
@@ -747,6 +776,15 @@ def ml_generate_comments(
                     kind="inline",
                     target_name=ff.name,
                 ))
+
+    if security_layer is not None:
+        for c in comments:
+            score, matched_ids, matched = security_layer.compute_risk_score(c.text, vector_type="SOURCE_CODE_COMMENT")
+            if score >= security_layer.sanitize_threshold:
+                if c.kind == "inline":
+                    c.text = f"# {security_layer.SANITIZED_PLACEHOLDER}"
+                else:
+                    c.text = f'"""{security_layer.SANITIZED_PLACEHOLDER}"""'
 
     comments.sort(key=lambda c: (c.lineno, c.kind))
     return comments
